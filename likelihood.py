@@ -35,7 +35,8 @@ class GRMLike(Discrete):
         for var in [theta, alpha, kappa, gamma, sigma]:
             self.param_list.append(tt.as_tensor_variable(floatX(var)))
 
-        self.params = {var.name: var for var in self.param_list}
+        par_names = ['theta', 'alpha', 'kappa', 'gamma', 'sigma']
+        self.params = {nm: var for nm, var in zip(par_names, self.param_list)}
 
         self.cprobst, self.probst = self.__init_probs()
 

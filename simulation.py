@@ -1,9 +1,26 @@
-from .likelihood import GRMLike
-
 import numpy as np
+from scipy.stats import norm
+
+from likelihood import GRMLike
+
+
+class _Unpickling(object):
+    pass
 
 
 class LikeParams(dict):
+    def __new__(cls, name, *args, **kwargs):
+        if name is _Unpickling:
+            instance = super(LikeParams, cls).__new__(cls, *args, **kwargs)
+            return instance
+        else:
+            instance = super(LikeParams, cls).__new__(cls, *args, **kwargs)
+            return instance
+
+
+    def __getnewargs__(self):
+        return _Unpickling,
+
     def __init__(self, npersons, nitems, nlevels):
         self.shape = (npersons, nitems, nlevels - 1)
         keys = ('theta', 'alpha', 'kappa', 'gamma', 'sigma')
@@ -11,6 +28,12 @@ class LikeParams(dict):
         def_dict['alpha'] += 1
         def_dict['sigma'] += 1
         super(LikeParams, self).__init__(**def_dict)
+
+    def __getstate__(self):
+        self.__dict__
+
+    def __setstate__(self, d):
+        self.__dict__.update(d)
 
     def __getattr__(self, attr):
         return self.get(attr)
@@ -54,29 +77,29 @@ class LikeParams(dict):
         return out_value
 
     def set_alpha(self, value):
-        value = np.array(value)
+        value = np.atleast_1d(value)
         self.alpha = self.__broadcast_alpha(value)
 
     def set_kappa(self, value):
-        value = np.array(value)
+        value = np.atleast_1d(value)
         if not np.all(np.diff(value, axis=-1) > 0):
             raise ValueError("Kappa must be strictly increasing.")
         self.kappa = self.__broadcast_level(value)
 
     def set_gamma(self, value):
-        value = np.array(value)
+        value = np.atleast_1d(value)
         if not np.all(np.diff(value, axis=-1) >= 0):
             raise ValueError("Gamma must be monotonically increasing.")
         self.gamma = self.__broadcast_level(value)
 
     def set_sigma(self, value):
-        value = np.array(value)
+        value = np.atleast_1d(value)
         if not np.all(np.diff(value, axis=-1) > 0):
             raise ValueError("Sigma must be monotonically increasing.")
         self.sigma = self.__broadcast_level(value)
 
     def set_theta(self, value):
-        value = np.array(value)
+        value = np.atleast_1d(value)
         shape = value.shape
         if any(np.array(shape[1:]) > 1):
             raise ValueError("Theta value must reduce to one dimension")
@@ -91,7 +114,10 @@ class LikeParams(dict):
         self.set_alpha(alphas)
         self.set_kappa(kappas)
 
-    def auto_theta(self):
+    def norm_theta(self):
+        self.set_theta(norm().rvs(size=self.shape[0]))
+
+    def line_theta(self):
         if not np.all(self.kappa == 0):
             diffs = -self.kappa/self.alpha
             lower = diffs.min()
@@ -110,30 +136,88 @@ class LikeParams(dict):
 
 
 class GRMFixed(object):
+    def __new__(cls, name, *args, **kwargs):
+        if name is _Unpickling:
+            return object.__new__(cls)
+        else:
+            instance = super(GRMFixed, cls).__new__(cls)
+            return instance
+
+    def __getnewargs__(self):
+        return _Unpickling,
+
     def __init__(self, npersons, nitems, nlevels):
         self.shape = (npersons, nitems, nlevels - 1)
         self.params = LikeParams(npersons, nitems, nlevels)
         self.__likelihood = GRMLike.dist(**self.params)
 
+    def __getstate__(self): return self.__dict__
+    def __setstate__(self, d): self.__dict__.update(d)
+
     def default_params(self):
-        self.params.set_diffs(np.linspace(2, -2, self.shape[2]), 3)
+        norm_quants = norm.ppf(np.linspace(1, 0, self.shape[2] + 2)[1:-1])
+        self.params.set_diffs(norm_quants, 3)
         self.params.set_gamma(np.linspace(0.1, 0.3, self.shape[2]))
         self.params.set_sigma(np.linspace(0.7, 0.9, self.shape[2]))
-        self.params.auto_theta()
+        self.params.norm_theta()
 
-    def check(self):
-        old_pars = {name: var.eval() for name, var in self.__likelihood.params}
-        return old_pars == self.params
+    def check_recompile(self):
+        old_dict = self.__likelihood.params
+        old_pars = {name: var.eval() for name, var in old_dict.items()}
+        dict_zip = ((old_pars[key], self.params[key]) for key in self.params)
+        return all(np.all(x == y) for x, y in dict_zip)
 
     @property
     def likelihood(self):
-        if not self.checK():
+        if not self.check_recompile():
             self.__likelihood = GRMLike.dist(**self.params)
         return self.__likelihood
 
-    def generate(self, size, seed=None):
+    def generate(self, size=1, seed=None):
         np.random.seed(seed)
         print("Seed Number: ", seed)
         self.dataset = self.likelihood.random(size=size)
 
         return self.dataset
+
+
+def stat_params(trace, varnames, stat):
+    stat_dict = {var: stat(trace[var], axis=0) for var in varnames}
+    if 'alpha' in varnames and 'gamma' in varnames and 'sigma' in varnames:
+        scale = stat_dict['sigma'] - stat_dict['gamma']
+        stat_dict['slope'] = stat_dict['alpha']*scale
+    return stat_dict
+
+
+def abs_bias(trace, params, varnames=None, stat=np.mean):
+    if varnames is None:
+        varnames = params.keys()
+    elif not all(x in params.keys() for x in varnames):
+        diff_keys = set(varnames) - set(params.keys())
+        raise ValueError("Params not found in GRM params: %s"
+                         % diff_keys)
+
+    stat_dict = stat_params(trace, varnames, stat)
+    bias_dict = {}
+    for var in varnames:
+        if var == 'theta':
+            true_val = params[var][:, :1, :1]
+        elif var == 'alpha':
+            true_val = params[var][:1, :, :1]
+        else:
+            true_val = params[var][:1, :, :]
+        bias_dict[var] = abs(stat_dict[var] - true_val)
+
+    if 'slope' in stat_dict:
+        scale = params['sigma'] - params['gamma']
+        bias_dict['slope'] = params['alpha']*scale
+        bias_dict['slope'] = abs(stat_dict['slope'] - bias_dict['slope'][:1])
+
+    return bias_dict
+
+
+def mean_abs_bias(trace, params, varnames=None, stat=np.mean):
+    bias_dict = abs_bias(trace, params, varnames, stat)
+    for var in bias_dict:
+        bias_dict[var] = bias_dict[var].mean()
+    return bias_dict
